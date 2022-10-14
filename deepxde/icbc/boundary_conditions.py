@@ -4,10 +4,10 @@ __all__ = [
     "BC",
     "DirichletBC",
     "NeumannBC",
-    "RobinBC",
-    "PeriodicBC",
     "OperatorBC",
+    "PeriodicBC",
     "PointSetBC",
+    "RobinBC",
 ]
 
 import numbers
@@ -18,6 +18,7 @@ import numpy as np
 
 from .. import backend as bkd
 from .. import config
+from .. import data
 from .. import gradients as grad
 from .. import utils
 from ..backend import backend_name
@@ -51,12 +52,14 @@ class BC(ABC):
 
     def normal_derivative(self, X, inputs, outputs, beg, end):
         dydx = grad.jacobian(outputs, inputs, i=self.component, j=None)[beg:end]
-        n = self.boundary_normal(X, beg, end)
+        n = self.boundary_normal(X, beg, end, None)
         return bkd.sum(dydx * n, 1, keepdims=True)
 
     @abstractmethod
-    def error(self, X, inputs, outputs, beg, end):
+    def error(self, X, inputs, outputs, beg, end, aux_var=None):
         """Returns the loss."""
+        # aux_var is used in PI-DeepONet, where aux_var is the input function evaluated
+        # at x.
 
 
 class DirichletBC(BC):
@@ -66,12 +69,12 @@ class DirichletBC(BC):
         super().__init__(geom, on_boundary, component)
         self.func = npfunc_range_autocache(utils.return_tensor(func))
 
-    def error(self, X, inputs, outputs, beg, end):
-        values = self.func(X, beg, end)
-        if bkd.ndim(values) > 0 and bkd.shape(values)[1] != 1:
+    def error(self, X, inputs, outputs, beg, end, aux_var=None):
+        values = self.func(X, beg, end, aux_var)
+        if bkd.ndim(values) == 2 and bkd.shape(values)[1] != 1:
             raise RuntimeError(
-                "DirichletBC func should return an array of shape N by 1 for a single"
-                " component. Use argument 'component' for different components."
+                "DirichletBC function should return an array of shape N by 1 for each "
+                "component. Use argument 'component' for different output components."
             )
         return outputs[beg:end, self.component : self.component + 1] - values
 
@@ -83,8 +86,8 @@ class NeumannBC(BC):
         super().__init__(geom, on_boundary, component)
         self.func = npfunc_range_autocache(utils.return_tensor(func))
 
-    def error(self, X, inputs, outputs, beg, end):
-        values = self.func(X, beg, end)
+    def error(self, X, inputs, outputs, beg, end, aux_var=None):
+        values = self.func(X, beg, end, aux_var)
         return self.normal_derivative(X, inputs, outputs, beg, end) - values
 
 
@@ -95,7 +98,7 @@ class RobinBC(BC):
         super().__init__(geom, on_boundary, component)
         self.func = func
 
-    def error(self, X, inputs, outputs, beg, end):
+    def error(self, X, inputs, outputs, beg, end, aux_var=None):
         return self.normal_derivative(X, inputs, outputs, beg, end) - self.func(
             X[beg:end], outputs[beg:end]
         )
@@ -118,7 +121,7 @@ class PeriodicBC(BC):
         X2 = self.geom.periodic_point(X1, self.component_x)
         return np.vstack((X1, X2))
 
-    def error(self, X, inputs, outputs, beg, end):
+    def error(self, X, inputs, outputs, beg, end, aux_var=None):
         mid = beg + (end - beg) // 2
         if self.derivative_order == 0:
             yleft = outputs[beg:mid, self.component : self.component + 1]
@@ -137,42 +140,73 @@ class OperatorBC(BC):
         geom: ``Geometry``.
         func: A function takes arguments (`inputs`, `outputs`, `X`)
             and outputs a tensor of size `N x 1`, where `N` is the length of `inputs`.
-            `inputs` and `outputs` are the network input and output tensors, respectively;
-            `X` are the NumPy array of the `inputs`.
+            `inputs` and `outputs` are the network input and output tensors,
+            respectively; `X` are the NumPy array of the `inputs`.
         on_boundary: (x, Geometry.on_boundary(x)) -> True/False.
+
+    Warning:
+        If you use `X` in `func`, then do not set ``num_test`` when you define
+        ``dde.data.PDE`` or ``dde.data.TimePDE``, otherwise DeepXDE would throw an
+        error. In this case, the training points will be used for testing, and this will
+        not affect the network training and training loss. This is a bug of DeepXDE,
+        which cannot be fixed in an easy way for all backends.
     """
 
     def __init__(self, geom, func, on_boundary):
         super().__init__(geom, on_boundary, 0)
         self.func = func
 
-    def error(self, X, inputs, outputs, beg, end):
+    def error(self, X, inputs, outputs, beg, end, aux_var=None):
         return self.func(inputs, outputs, X)[beg:end]
 
 
 class PointSetBC:
     """Dirichlet boundary condition for a set of points.
+
     Compare the output (that associates with `points`) with `values` (target data).
 
     Args:
-        points: An array of points where the corresponding target values are known and used for training.
+        points: An array of points where the corresponding target values are known and
+            used for training.
         values: An array of values that gives the exact solution of the problem.
         component: The output component satisfying this BC.
+        batch_size: The number of points per minibatch, or `None` to return all points.
+            This is only supported for the backend PyTorch.
+        shuffle: Randomize the order on each pass through the data when batching.
     """
 
-    def __init__(self, points, values, component=0):
+    def __init__(self, points, values, component=0, batch_size=None, shuffle=True):
         self.points = np.array(points, dtype=config.real(np))
         if not isinstance(values, numbers.Number) and values.shape[1] != 1:
             raise RuntimeError(
-                "PointSetBC should output 1D values. Use argument 'component' for different components."
+                "PointSetBC should output 1D values. Use argument 'component' for "
+                "different components."
             )
         self.values = bkd.as_tensor(values, dtype=config.real(bkd.lib))
         self.component = component
+        self.batch_size = batch_size
+
+        if batch_size is not None: # batch iterator and state
+            if backend_name != "pytorch":
+                raise RuntimeError("batch_size only implemented for pytorch backend")
+            self.batch_sampler = data.sampler.BatchSampler(len(self), shuffle=shuffle)
+            self.batch_indices = None
+
+    def __len__(self):
+        return self.points.shape[0]
 
     def collocation_points(self, X):
+        if self.batch_size is not None:
+            self.batch_indices = self.batch_sampler.get_next(self.batch_size)
+            return self.points[self.batch_indices]
         return self.points
 
-    def error(self, X, inputs, outputs, beg, end):
+    def error(self, X, inputs, outputs, beg, end, aux_var=None):
+        if self.batch_size is not None:
+            return (
+                outputs[beg:end, self.component : self.component + 1]
+                - self.values[self.batch_indices]
+            )
         return outputs[beg:end, self.component : self.component + 1] - self.values
 
 
@@ -204,17 +238,35 @@ def npfunc_range_autocache(func):
     cache = {}
 
     @wraps(func)
-    def wrapper_nocache(X, beg, end):
+    def wrapper_nocache(X, beg, end, _):
         return func(X[beg:end])
 
     @wraps(func)
-    def wrapper_cache(X, beg, end):
+    def wrapper_nocache_auxiliary(X, beg, end, aux_var):
+        return func(X[beg:end], aux_var[beg:end])
+
+    @wraps(func)
+    def wrapper_cache(X, beg, end, _):
         key = (id(X), beg, end)
         if key not in cache:
             cache[key] = func(X[beg:end])
         return cache[key]
 
-    if backend_name in ["tensorflow.compat.v1", "tensorflow"]:
-        return wrapper_nocache
-    if backend_name == "pytorch":
-        return wrapper_cache
+    @wraps(func)
+    def wrapper_cache_auxiliary(X, beg, end, aux_var):
+        # Even if X is the same one, aux_var could be different
+        key = (id(X), beg, end)
+        if key not in cache:
+            cache[key] = func(X[beg:end], aux_var[beg:end])
+        return cache[key]
+
+    if backend_name in ["tensorflow.compat.v1", "tensorflow", "jax"]:
+        if utils.get_num_args(func) == 1:
+            return wrapper_nocache
+        if utils.get_num_args(func) == 2:
+            return wrapper_nocache_auxiliary
+    if backend_name in ["pytorch", "paddle"]:
+        if utils.get_num_args(func) == 1:
+            return wrapper_cache
+        if utils.get_num_args(func) == 2:
+            return wrapper_nocache_auxiliary

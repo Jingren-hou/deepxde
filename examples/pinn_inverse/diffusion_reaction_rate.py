@@ -1,11 +1,10 @@
-"""Backend supported: tensorflow.compat.v1
+"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch
 
 Implementation for the diffusion-reaction system with a space-dependent reaction rate in paper https://arxiv.org/abs/2111.02801.
 """
 import deepxde as dde
 import matplotlib.pyplot as plt
 import numpy as np
-from deepxde.backend import tf
 from scipy.integrate import solve_bvp
 
 l = 0.01
@@ -39,7 +38,7 @@ geom = dde.geometry.Interval(0, 1)
 def pde(x, y):
     u, k = y[:, 0:1], y[:, 1:2]
     du_xx = dde.grad.hessian(y, x, i=0, j=0, component=0)
-    return l * du_xx - u * k - tf.sin(2 * np.pi * x)
+    return l * du_xx - u * k - dde.backend.sin(2 * np.pi * x)
 
 
 def func(x):
@@ -65,7 +64,7 @@ net = dde.nn.PFNN([1, [20, 20], [20, 20], 2], "tanh", "Glorot uniform")
 model = dde.Model(data, net)
 model.compile("adam", lr=1e-3)
 
-losshistory, train_state = model.train(epochs=20000)
+losshistory, train_state = model.train(iterations=20000)
 
 x = geom.uniform_points(500)
 yhat = model.predict(x)

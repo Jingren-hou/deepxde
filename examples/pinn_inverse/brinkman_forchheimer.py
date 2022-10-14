@@ -1,4 +1,4 @@
-"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch
+"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch, paddle
 
 Implementation of Brinkman-Forchheimer equation example in paper https://arxiv.org/pdf/2111.02801.pdf.
 """
@@ -58,7 +58,7 @@ model = dde.Model(data, net)
 model.compile("adam", lr=0.001, metrics=["l2 relative error"], external_trainable_variables=[v_e, K])
 variable = dde.callbacks.VariableValue([v_e, K], period=200, filename="variables1.dat")
 
-losshistory, train_state = model.train(epochs=30000, callbacks=[variable])
+losshistory, train_state = model.train(iterations=30000, callbacks=[variable])
 dde.saveplot(losshistory, train_state, issave=True, isplot=True)
 
 lines = open("variables1.dat", "r").readlines()

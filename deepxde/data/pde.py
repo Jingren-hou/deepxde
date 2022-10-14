@@ -3,6 +3,7 @@ import numpy as np
 from .data import Data
 from .. import backend as bkd
 from .. import config
+from ..backend import backend_name
 from ..utils import get_num_args, run_if_all_none
 
 
@@ -24,9 +25,9 @@ class PDE(Data):
             `num_boundary` sampled points.
         exclusions: A Numpy array of points to be excluded for training.
         solution: The reference solution.
-        num_test: The number of points sampled inside the domain for testing. The testing
-            points on the boundary are the same set of points used for training. If
-            ``None``, then the training points will be used for testing.
+        num_test: The number of points sampled inside the domain for testing PDE loss.
+            The testing points for BCs/ICs are the same set of points used for training.
+            If ``None``, then the training points will be used for testing.
         auxiliary_var_function: A function that inputs `train_x` or `test_x` and outputs
             auxiliary variables.
 
@@ -52,20 +53,21 @@ class PDE(Data):
             error= dde.metrics.l2_relative_error(y_true, y_pred)
 
     Attributes:
-        train_x_all: A Numpy array of all points for training. `train_x_all` is
-            unordered, and does not have duplication.
-        train_x: A Numpy array of the points fed into the network for training.
-            `train_x` is constructed from `train_x_all`, ordered from BCs to PDE, and
-            may have duplicate points.
+        train_x_all: A Numpy array of points for PDE training. `train_x_all` is
+            unordered, and does not have duplication. If there is PDE, then
+            `train_x_all` is used as the training points of PDE.
         train_x_bc: A Numpy array of the training points for BCs. `train_x_bc` is
             constructed from `train_x_all` at the first step of training, by default it
             won't be updated when `train_x_all` changes. To update `train_x_bc`, set it
             to `None` and call `bc_points`, and then update the loss function by
             ``model.compile()``.
         num_bcs (list): `num_bcs[i]` is the number of points for `bcs[i]`.
+        train_x: A Numpy array of the points fed into the network for training.
+            `train_x` is ordered from BC points (`train_x_bc`) to PDE points
+            (`train_x_all`), and may have duplicate points.
+        train_aux_vars: Auxiliary variables that associate with `train_x`.
         test_x: A Numpy array of the points fed into the network for testing, ordered
             from BCs to PDE. The BC points are exactly the same points in `train_x_bc`.
-        train_aux_vars: Auxiliary variables that associate with `train_x`.
         test_aux_vars: Auxiliary variables that associate with `test_x`.
     """
 
@@ -76,7 +78,7 @@ class PDE(Data):
         bcs,
         num_domain=0,
         num_boundary=0,
-        train_distribution="Sobol",
+        train_distribution="Hammersley",
         anchors=None,
         exclusions=None,
         solution=None,
@@ -89,19 +91,6 @@ class PDE(Data):
 
         self.num_domain = num_domain
         self.num_boundary = num_boundary
-        if train_distribution not in [
-            "uniform",
-            "pseudo",
-            "LHS",
-            "Halton",
-            "Hammersley",
-            "Sobol",
-        ]:
-            raise ValueError(
-                "train_distribution == {} is not available choices.".format(
-                    train_distribution
-                )
-            )
         self.train_distribution = train_distribution
         self.anchors = None if anchors is None else anchors.astype(config.real(np))
         self.exclusions = exclusions
@@ -111,48 +100,61 @@ class PDE(Data):
 
         self.auxiliary_var_fn = auxiliary_var_function
 
-        # TODO: train_x_all is used for PDE losses. It is better to add train_x_pde explicitly.
+        # TODO: train_x_all is used for PDE losses. It is better to add train_x_pde 
+        # explicitly.
         self.train_x_all = None
-        self.train_x, self.train_y = None, None
         self.train_x_bc = None
         self.num_bcs = None
+
+        # these include both BC and PDE points
+        self.train_x, self.train_y = None, None
         self.test_x, self.test_y = None, None
         self.train_aux_vars, self.test_aux_vars = None, None
 
         self.train_next_batch()
         self.test()
 
-    def losses(self, targets, outputs, loss, model):
+    def losses(self, targets, outputs, loss_fn, inputs, model, aux=None):
+        if backend_name in ["tensorflow.compat.v1", "tensorflow", "pytorch", "paddle"]:
+            outputs_pde = outputs
+        elif backend_name == "jax":
+            # JAX requires pure functions
+            outputs_pde = (outputs, aux[0])
+
         f = []
         if self.pde is not None:
             if get_num_args(self.pde) == 2:
-                f = self.pde(model.net.inputs, outputs)
+                f = self.pde(inputs, outputs_pde)
             elif get_num_args(self.pde) == 3:
                 if self.auxiliary_var_fn is None:
-                    raise ValueError("Auxiliary variable function not defined.")
-                f = self.pde(model.net.inputs, outputs, model.net.auxiliary_vars)
+                    if aux is None or len(aux) == 1:
+                        raise ValueError("Auxiliary variable function not defined.")
+                    f = self.pde(inputs, outputs_pde, unknowns=aux[1])
+                else:
+                    f = self.pde(inputs, outputs_pde, model.net.auxiliary_vars)
             if not isinstance(f, (list, tuple)):
                 f = [f]
 
-        if not isinstance(loss, (list, tuple)):
-            loss = [loss] * (len(f) + len(self.bcs))
-        elif len(loss) != len(f) + len(self.bcs):
+        if not isinstance(loss_fn, (list, tuple)):
+            loss_fn = [loss_fn] * (len(f) + len(self.bcs))
+        elif len(loss_fn) != len(f) + len(self.bcs):
             raise ValueError(
                 "There are {} errors, but only {} losses.".format(
-                    len(f) + len(self.bcs), len(loss)
+                    len(f) + len(self.bcs), len(loss_fn)
                 )
             )
 
         bcs_start = np.cumsum([0] + self.num_bcs)
+        bcs_start = list(map(int, bcs_start))
         error_f = [fi[bcs_start[-1] :] for fi in f]
         losses = [
-            loss[i](bkd.zeros_like(error), error) for i, error in enumerate(error_f)
+            loss_fn[i](bkd.zeros_like(error), error) for i, error in enumerate(error_f)
         ]
         for i, bc in enumerate(self.bcs):
             beg, end = bcs_start[i], bcs_start[i + 1]
             # The same BC points are used for training and testing.
-            error = bc.error(self.train_x, model.net.inputs, outputs, beg, end)
-            losses.append(loss[len(error_f) + i](bkd.zeros_like(error), error))
+            error = bc.error(self.train_x, inputs, outputs, beg, end)
+            losses.append(loss_fn[len(error_f) + i](bkd.zeros_like(error), error))
         return losses
 
     @run_if_all_none("train_x", "train_y", "train_aux_vars")
@@ -181,8 +183,12 @@ class PDE(Data):
             )
         return self.test_x, self.test_y, self.test_aux_vars
 
-    def resample_train_points(self):
-        """Resample the training points for PDEs. The BC points will not be updated."""
+    def resample_train_points(self, pde_points=True, bc_points=True):
+        """Resample the training points for PDE and/or BC."""
+        if pde_points:
+            self.train_x_all = None
+        if bc_points:
+            self.train_x_bc = None
         self.train_x, self.train_y, self.train_aux_vars = None, None, None
         self.train_next_batch()
 
@@ -216,6 +222,7 @@ class PDE(Data):
                 config.real(np)
             )
 
+    @run_if_all_none("train_x_all")
     def train_points(self):
         X = np.empty((0, self.geom.dim), dtype=config.real(np))
         if self.num_domain > 0:
@@ -241,6 +248,7 @@ class PDE(Data):
                 return not np.any([np.allclose(x, y) for y in self.exclusions])
 
             X = np.array(list(filter(is_not_excluded, X)))
+        self.train_x_all = X
         return X
 
     @run_if_all_none("train_x_bc")
@@ -277,7 +285,7 @@ class TimePDE(PDE):
         num_domain=0,
         num_boundary=0,
         num_initial=0,
-        train_distribution="Sobol",
+        train_distribution="Hammersley",
         anchors=None,
         exclusions=None,
         solution=None,
@@ -299,6 +307,7 @@ class TimePDE(PDE):
             auxiliary_var_function=auxiliary_var_function,
         )
 
+    @run_if_all_none("train_x_all")
     def train_points(self):
         X = super().train_points()
         if self.num_initial > 0:
@@ -315,4 +324,5 @@ class TimePDE(PDE):
 
                 tmp = np.array(list(filter(is_not_excluded, tmp)))
             X = np.vstack((tmp, X))
+        self.train_x_all = X
         return X

@@ -1,4 +1,4 @@
-__all__ = ["Model", "TrainState", "LossHistory"]
+__all__ = ["LossHistory", "Model", "TrainState"]
 
 import pickle
 from collections import OrderedDict
@@ -12,7 +12,7 @@ from . import losses as losses_module
 from . import metrics as metrics_module
 from . import optimizers
 from . import utils
-from .backend import backend_name, tf, torch, jax
+from .backend import backend_name, tf, torch, jax, paddle
 from .callbacks import CallbackList
 
 
@@ -41,13 +41,17 @@ class Model:
         self.opt = None
         # Tensor or callable
         self.outputs = None
-        self.outputs_losses = None
+        self.outputs_losses_train = None
+        self.outputs_losses_test = None
         self.train_step = None
         if backend_name == "tensorflow.compat.v1":
             self.sess = None
             self.saver = None
+        elif backend_name == "pytorch":
+            self.lr_scheduler = None
         elif backend_name == "jax":
-            self.opt_state = None  # TODO: to be removed to opt module
+            self.opt_state = None
+            self.params = None
 
     @utils.timing
     def compile(
@@ -63,34 +67,46 @@ class Model:
         """Configures the model for training.
 
         Args:
-            optimizer: String. Name of optimizer.
-            lr: A Tensor or a floating point value. The learning rate. For L-BFGS, use
-                `dde.optimizers.set_LBFGS_options` to set the hyperparameters.
-            loss: If the same loss is used for all errors, then `loss` is a String (name
-                of objective function) or objective function. If different errors use
+            optimizer: String name of an optimizer, or a backend optimizer class
+                instance.
+            lr (float): The learning rate. For L-BFGS, use
+                ``dde.optimizers.set_LBFGS_options`` to set the hyperparameters.
+            loss: If the same loss is used for all errors, then `loss` is a String name
+                of a loss function or a loss function. If different errors use
                 different losses, then `loss` is a list whose size is equal to the
                 number of errors.
             metrics: List of metrics to be evaluated by the model during training.
-            decay: Tuple. Name and parameters of decay to the initial learning rate. One
-                of the following options:
+            decay (tuple): Name and parameters of decay to the initial learning rate.
+                One of the following options:
 
-                - `inverse time decay <https://www.tensorflow.org/api_docs/python/tf/keras/optimizers/schedules/InverseTimeDecay>`_: ("inverse time", decay_steps, decay_rate)
-                - `cosine decay <https://www.tensorflow.org/api_docs/python/tf/keras/optimizers/schedules/CosineDecay>`_: ("cosine", decay_steps, alpha)
+                - For backend TensorFlow 1.x:
+
+                    - `inverse_time_decay <https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/inverse_time_decay>`_: ("inverse time", decay_steps, decay_rate)
+                    - `cosine_decay <https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/cosine_decay>`_: ("cosine", decay_steps, alpha)
+
+                - For backend TensorFlow 2.x:
+
+                    - `InverseTimeDecay <https://www.tensorflow.org/api_docs/python/tf/keras/optimizers/schedules/InverseTimeDecay>`_: ("inverse time", decay_steps, decay_rate)
+                    - `CosineDecay <https://www.tensorflow.org/api_docs/python/tf/keras/optimizers/schedules/CosineDecay>`_: ("cosine", decay_steps, alpha)
+
+                - For backend PyTorch:
+
+                    - `StepLR <https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.StepLR.html>`_: ("step", step_size, gamma)
 
             loss_weights: A list specifying scalar coefficients (Python floats) to
                 weight the loss contributions. The loss value that will be minimized by
                 the model will then be the weighted sum of all individual losses,
-                weighted by the loss_weights coefficients.
-            external_trainable_variables: A trainable ``tf.Variable`` object or a list
-                of trainable ``tf.Variable`` objects. The unknown parameters in the
+                weighted by the `loss_weights` coefficients.
+            external_trainable_variables: A trainable ``dde.Variable`` object or a list
+                of trainable ``dde.Variable`` objects. The unknown parameters in the
                 physics systems that need to be recovered. If the backend is
                 tensorflow.compat.v1, `external_trainable_variables` is ignored, and all
-                trainable ``tf.Variable`` objects are automatically collected.
+                trainable ``dde.Variable`` objects are automatically collected.
         """
         print("Compiling model...")
-
         self.opt_name = optimizer
         loss_fn = losses_module.get(loss)
+        self.losshistory.set_loss_weights(loss_weights)
         if external_trainable_variables is None:
             self.external_trainable_variables = []
         else:
@@ -112,7 +128,8 @@ class Model:
             self._compile_pytorch(lr, loss_fn, decay, loss_weights)
         elif backend_name == "jax":
             self._compile_jax(lr, loss_fn, decay, loss_weights)
-
+        elif backend_name == "paddle":
+            self._compile_paddle(lr, loss_fn, decay, loss_weights)
         # metrics may use model variables such as self.net, and thus are instantiated
         # after backend compile.
         metrics = metrics or []
@@ -123,26 +140,40 @@ class Model:
         if not self.net.built:
             self.net.build()
         if self.sess is None:
-            self.sess = tf.Session()
+            if config.xla_jit:
+                cfg = tf.ConfigProto()
+                cfg.graph_options.optimizer_options.global_jit_level = (
+                    tf.OptimizerOptions.ON_2
+                )
+                self.sess = tf.Session(config=cfg)
+            else:
+                self.sess = tf.Session()
             self.saver = tf.train.Saver(max_to_keep=None)
 
-        # Data losses
-        losses = self.data.losses(self.net.targets, self.net.outputs, loss_fn, self)
-        if not isinstance(losses, list):
-            losses = [losses]
-        # Regularization loss
-        if self.net.regularizer is not None:
-            losses.append(tf.losses.get_regularization_loss())
-        losses = tf.convert_to_tensor(losses)
-        # Weighted losses
-        if loss_weights is not None:
-            losses *= loss_weights
-            self.losshistory.set_loss_weights(loss_weights)
-        total_loss = tf.math.reduce_sum(losses)
+        def losses(losses_fn):
+            # Data losses
+            losses = losses_fn(
+                self.net.targets, self.net.outputs, loss_fn, self.net.inputs, self
+            )
+            if not isinstance(losses, list):
+                losses = [losses]
+            # Regularization loss
+            if self.net.regularizer is not None:
+                losses.append(tf.losses.get_regularization_loss())
+            losses = tf.convert_to_tensor(losses)
+            # Weighted losses
+            if loss_weights is not None:
+                losses *= loss_weights
+            return losses
+
+        losses_train = losses(self.data.losses_train)
+        losses_test = losses(self.data.losses_test)
+        total_loss = tf.math.reduce_sum(losses_train)
 
         # Tensors
         self.outputs = self.net.outputs
-        self.outputs_losses = [self.net.outputs, losses]
+        self.outputs_losses_train = [self.net.outputs, losses_train]
+        self.outputs_losses_test = [self.net.outputs, losses_test]
         self.train_step = optimizers.get(
             total_loss, self.opt_name, learning_rate=lr, decay=decay
         )
@@ -150,22 +181,17 @@ class Model:
     def _compile_tensorflow(self, lr, loss_fn, decay, loss_weights):
         """tensorflow"""
 
-        # TODO: Avoid creating multiple graphs by using tf.TensorSpec.
-        @tf.function
+        @tf.function(jit_compile=config.xla_jit)
         def outputs(training, inputs):
             return self.net(inputs, training=training)
 
-        # TODO: Avoid creating multiple graphs by using tf.TensorSpec.
-        @tf.function
-        def outputs_losses(training, inputs, targets, auxiliary_vars):
-            self.net.training = training
-            self.net.inputs = inputs
+        def outputs_losses(training, inputs, targets, auxiliary_vars, losses_fn):
             self.net.auxiliary_vars = auxiliary_vars
             # Don't call outputs() decorated by @tf.function above, otherwise the
             # gradient of outputs wrt inputs will be lost here.
             outputs_ = self.net(inputs, training=training)
             # Data losses
-            losses = self.data.losses(targets, outputs_, loss_fn, self)
+            losses = losses_fn(targets, outputs_, loss_fn, inputs, self)
             if not isinstance(losses, list):
                 losses = [losses]
             # Regularization loss
@@ -175,16 +201,27 @@ class Model:
             # Weighted losses
             if loss_weights is not None:
                 losses *= loss_weights
-                self.losshistory.set_loss_weights(loss_weights)
             return outputs_, losses
+
+        @tf.function(jit_compile=config.xla_jit)
+        def outputs_losses_train(inputs, targets, auxiliary_vars):
+            return outputs_losses(
+                True, inputs, targets, auxiliary_vars, self.data.losses_train
+            )
+
+        @tf.function(jit_compile=config.xla_jit)
+        def outputs_losses_test(inputs, targets, auxiliary_vars):
+            return outputs_losses(
+                False, inputs, targets, auxiliary_vars, self.data.losses_test
+            )
 
         opt = optimizers.get(self.opt_name, learning_rate=lr, decay=decay)
 
-        @tf.function
+        @tf.function(jit_compile=config.xla_jit)
         def train_step(inputs, targets, auxiliary_vars):
             # inputs and targets are np.ndarray and automatically converted to Tensor.
             with tf.GradientTape() as tape:
-                losses = outputs_losses(True, inputs, targets, auxiliary_vars)[1]
+                losses = outputs_losses_train(inputs, targets, auxiliary_vars)[1]
                 total_loss = tf.math.reduce_sum(losses)
             trainable_variables = (
                 self.net.trainable_variables + self.external_trainable_variables
@@ -196,7 +233,7 @@ class Model:
             inputs, targets, auxiliary_vars, previous_optimizer_results=None
         ):
             def build_loss():
-                losses = outputs_losses(True, inputs, targets, auxiliary_vars)[1]
+                losses = outputs_losses_train(inputs, targets, auxiliary_vars)[1]
                 return tf.math.reduce_sum(losses)
 
             trainable_variables = (
@@ -206,7 +243,8 @@ class Model:
 
         # Callables
         self.outputs = outputs
-        self.outputs_losses = outputs_losses
+        self.outputs_losses_train = outputs_losses_train
+        self.outputs_losses_test = outputs_losses_test
         self.train_step = (
             train_step
             if not optimizers.is_external_optimizer(self.opt_name)
@@ -219,32 +257,196 @@ class Model:
         def outputs(training, inputs):
             self.net.train(mode=training)
             with torch.no_grad():
-                return self.net(torch.as_tensor(inputs))
+                if isinstance(inputs, tuple):
+                    inputs = tuple(
+                        map(lambda x: torch.as_tensor(x).requires_grad_(), inputs)
+                    )
+                else:
+                    inputs = torch.as_tensor(inputs)
+                    inputs.requires_grad_()
+            return self.net(inputs)
 
-        def outputs_losses(training, inputs, targets):
+        def outputs_losses(training, inputs, targets, losses_fn):
             self.net.train(mode=training)
-            self.net.inputs = torch.as_tensor(inputs)
-            self.net.inputs.requires_grad_()
-            outputs_ = self.net(self.net.inputs)
+            if isinstance(inputs, tuple):
+                inputs = tuple(
+                    map(lambda x: torch.as_tensor(x).requires_grad_(), inputs)
+                )
+            else:
+                inputs = torch.as_tensor(inputs)
+                inputs.requires_grad_()
+            outputs_ = self.net(inputs)
             # Data losses
             if targets is not None:
                 targets = torch.as_tensor(targets)
-            losses = self.data.losses(targets, outputs_, loss_fn, self)
+            losses = losses_fn(targets, outputs_, loss_fn, inputs, self)
             if not isinstance(losses, list):
                 losses = [losses]
-            # TODO: regularization
             losses = torch.stack(losses)
             # Weighted losses
             if loss_weights is not None:
                 losses *= torch.as_tensor(loss_weights)
-                self.losshistory.set_loss_weights(loss_weights)
             # Clear cached Jacobians and Hessians.
             grad.clear()
             return outputs_, losses
 
+        def outputs_losses_train(inputs, targets):
+            return outputs_losses(True, inputs, targets, self.data.losses_train)
+
+        def outputs_losses_test(inputs, targets):
+            return outputs_losses(False, inputs, targets, self.data.losses_test)
+
         # Another way is using per-parameter options
         # https://pytorch.org/docs/stable/optim.html#per-parameter-options,
         # but not all optimizers (such as L-BFGS) support this.
+        trainable_variables = (
+            list(self.net.parameters()) + self.external_trainable_variables
+        )
+        if self.net.regularizer is None:
+            self.opt, self.lr_scheduler = optimizers.get(
+                trainable_variables, self.opt_name, learning_rate=lr, decay=decay
+            )
+        else:
+            if self.net.regularizer[0] == "l2":
+                self.opt, self.lr_scheduler = optimizers.get(
+                    trainable_variables,
+                    self.opt_name,
+                    learning_rate=lr,
+                    decay=decay,
+                    weight_decay=self.net.regularizer[1],
+                )
+            else:
+                raise NotImplementedError(
+                    f"{self.net.regularizer[0]} regularizaiton to be implemented for "
+                    "backend pytorch."
+                )
+
+        def train_step(inputs, targets):
+            def closure():
+                losses = outputs_losses_train(inputs, targets)[1]
+                total_loss = torch.sum(losses)
+                self.opt.zero_grad()
+                total_loss.backward()
+                return total_loss
+
+            self.opt.step(closure)
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+
+        # Callables
+        self.outputs = outputs
+        self.outputs_losses_train = outputs_losses_train
+        self.outputs_losses_test = outputs_losses_test
+        self.train_step = train_step
+
+    def _compile_jax(self, lr, loss_fn, decay, loss_weights):
+        """jax"""
+        # Initialize the network's parameters
+        key = jax.random.PRNGKey(config.jax_random_seed)
+        self.net.params = self.net.init(key, self.data.test()[0])
+        self.params = [self.net.params, self.external_trainable_variables]
+        # TODO: learning rate decay
+        self.opt = optimizers.get(self.opt_name, learning_rate=lr)
+        self.opt_state = self.opt.init(self.params)
+
+        @jax.jit
+        def outputs(params, training, inputs):
+            return self.net.apply(params, inputs, training=training)
+
+        def outputs_losses(params, training, inputs, targets, losses_fn):
+            nn_params, ext_params = params
+            # TODO: Add auxiliary vars
+            def outputs_fn(inputs):
+                return self.net.apply(nn_params, inputs, training=training)
+
+            outputs_ = self.net.apply(nn_params, inputs, training=training)
+            # Data losses
+            # We use aux so that self.data.losses is a pure function.
+            aux = [outputs_fn, ext_params] if ext_params else [outputs_fn]
+            losses = losses_fn(targets, outputs_, loss_fn, inputs, self, aux=aux)
+            # TODO: Add regularization loss, weighted losses
+            if not isinstance(losses, list):
+                losses = [losses]
+            losses = jax.numpy.asarray(losses)
+            return outputs_, losses
+
+        @jax.jit
+        def outputs_losses_train(params, inputs, targets):
+            return outputs_losses(params, True, inputs, targets, self.data.losses_train)
+
+        @jax.jit
+        def outputs_losses_test(params, inputs, targets):
+            return outputs_losses(params, False, inputs, targets, self.data.losses_test)
+
+        @jax.jit
+        def train_step(params, opt_state, inputs, targets):
+            def loss_function(params):
+                return jax.numpy.sum(outputs_losses_train(params, inputs, targets)[1])
+
+            grad_fn = jax.grad(loss_function)
+            grads = grad_fn(params)
+            updates, new_opt_state = self.opt.update(grads, opt_state)
+            new_params = optimizers.apply_updates(params, updates)
+            return new_params, new_opt_state
+
+        # Pure functions
+        self.outputs = outputs
+        self.outputs_losses_train = outputs_losses_train
+        self.outputs_losses_test = outputs_losses_test
+        self.train_step = train_step
+
+    def _compile_paddle(self, lr, loss_fn, decay, loss_weights):
+        """paddle"""
+
+        def outputs(training, inputs):
+            if training:
+                self.net.train()
+            else:
+                self.net.eval()
+            with paddle.no_grad():
+                if isinstance(inputs, tuple):
+                    inputs = tuple(
+                        map(lambda x: paddle.to_tensor(x, stop_gradient=False), inputs)
+                    )
+                else:
+                    inputs = paddle.to_tensor(inputs, stop_gradient=False)
+                return self.net(inputs)
+
+        def outputs_losses(training, inputs, targets, losses_fn):
+            if training:
+                self.net.train()
+            else:
+                self.net.eval()
+
+            if isinstance(inputs, tuple):
+                inputs = tuple(
+                    map(lambda x: paddle.to_tensor(x, stop_gradient=False), inputs)
+                )
+            else:
+                inputs = paddle.to_tensor(inputs, stop_gradient=False)
+
+            outputs_ = self.net(inputs)
+            # Data losses
+            if targets is not None:
+                targets = paddle.to_tensor(targets)
+            losses = losses_fn(targets, outputs_, loss_fn, inputs, self)
+            if not isinstance(losses, list):
+                losses = [losses]
+            # TODO: regularization
+            losses = paddle.concat(losses, axis=0)
+            # Weighted losses
+            if loss_weights is not None:
+                losses *= paddle.to_tensor(loss_weights)
+            # Clear cached Jacobians and Hessians.
+            grad.clear()
+            return outputs_, losses
+
+        def outputs_losses_train(inputs, targets):
+            return outputs_losses(True, inputs, targets, self.data.losses_train)
+
+        def outputs_losses_test(inputs, targets):
+            return outputs_losses(False, inputs, targets, self.data.losses_test)
+
         trainable_variables = (
             list(self.net.parameters()) + self.external_trainable_variables
         )
@@ -253,99 +455,49 @@ class Model:
         )
 
         def train_step(inputs, targets):
-            def closure():
-                losses = outputs_losses(True, inputs, targets)[1]
-                total_loss = torch.sum(losses)
-                self.opt.zero_grad()
-                total_loss.backward()
-                return total_loss
-
-            self.opt.step(closure)
+            losses = outputs_losses_train(inputs, targets)[1]
+            total_loss = paddle.sum(losses)
+            total_loss.backward()
+            self.opt.step()
+            self.opt.clear_grad()
 
         # Callables
         self.outputs = outputs
-        self.outputs_losses = outputs_losses
-        self.train_step = train_step
-
-    def _compile_jax(self, lr, loss_fn, decay, loss_weights):
-        """jax"""
-        # initialize network's parameters
-        # TODO: Init should move to network module, because we don't know how to init here, e.g., DeepONet has two inputs.
-        key = jax.random.PRNGKey(config.jax_random_seed)
-        x = jax.numpy.empty(shape=[1, self.net.layer_sizes[0]])
-        self.net.params = self.net.init(key, x)
-
-        @jax.jit
-        def inner_outputs(params, training, inputs):
-            return self.net.apply(params, training, inputs)
-
-        @jax.jit
-        def inner_outputs_losses(params, training, inputs, targets):
-            # TODO: add auxiliary vars, regularization loss, weighted losses
-            outputs_ = self.net.apply(params, inputs, training=training)
-            # Data losses
-            losses = self.data.losses(targets, outputs_, loss_fn, self)
-            if not isinstance(losses, list):
-                losses = [losses]
-            return outputs_, losses
-
-        @jax.jit
-        def inner_train_step(params, opt_state, inputs, targets):
-            def loss_function(params):
-                losses = inner_outputs_losses(params, True, inputs, targets)[1]
-                return jax.numpy.sum(jax.numpy.stack(losses))
-
-            grad_fn = jax.grad(
-                loss_function
-            )  # jax.value_and_grad seems to be slightly faster than jax.grad for function approximation
-            grads = grad_fn(params)
-            updates, new_opt_state = self.opt.update(grads, opt_state)
-            new_params = optimizers.apply_updates(params, updates)
-            return new_params, new_opt_state
-
-        def outputs(training, inputs):
-            return inner_outputs(self.net.params, training, inputs)
-
-        def outputs_losses(training, inputs, targets):
-            return inner_outputs_losses(self.net.params, training, inputs, targets)
-
-        def train_step(inputs, targets):
-            self.net.params, self.opt_state = inner_train_step(
-                self.net.params, self.opt_state, inputs, targets
-            )
-
-        # TODO: add decay
-        self.opt = optimizers.get(self.opt_name, learning_rate=lr)
-        self.opt_state = self.opt.init(self.net.params)
-
-        # Callables
-        self.outputs = outputs
-        self.outputs_losses = outputs_losses
+        self.outputs_losses_train = outputs_losses_train
+        self.outputs_losses_test = outputs_losses_test
         self.train_step = train_step
 
     def _outputs(self, training, inputs):
         if backend_name == "tensorflow.compat.v1":
             feed_dict = self.net.feed_dict(training, inputs)
             return self.sess.run(self.outputs, feed_dict=feed_dict)
-        # tensorflow and pytorch
-        outs = self.outputs(training, inputs)
+        if backend_name in ["tensorflow", "pytorch", "paddle"]:
+            outs = self.outputs(training, inputs)
+        elif backend_name == "jax":
+            outs = self.outputs(self.net.params, training, inputs)
         return utils.to_numpy(outs)
 
     def _outputs_losses(self, training, inputs, targets, auxiliary_vars):
+        if training:
+            outputs_losses = self.outputs_losses_train
+        else:
+            outputs_losses = self.outputs_losses_test
         if backend_name == "tensorflow.compat.v1":
             feed_dict = self.net.feed_dict(training, inputs, targets, auxiliary_vars)
-            return self.sess.run(self.outputs_losses, feed_dict=feed_dict)
+            return self.sess.run(outputs_losses, feed_dict=feed_dict)
         if backend_name == "tensorflow":
-            outs = self.outputs_losses(training, inputs, targets, auxiliary_vars)
+            outs = outputs_losses(inputs, targets, auxiliary_vars)
         elif backend_name == "pytorch":
             # TODO: auxiliary_vars
             self.net.requires_grad_(requires_grad=False)
-            outs = self.outputs_losses(training, inputs, targets)
+            outs = outputs_losses(inputs, targets)
             self.net.requires_grad_()
         elif backend_name == "jax":
             # TODO: auxiliary_vars
-            outs = self.outputs_losses(training, inputs, targets)
-        return utils.to_numpy(outs)
+            outs = outputs_losses(self.params, inputs, targets)
+        elif backend_name == "paddle":
+            outs = outputs_losses(inputs, targets)
+        return utils.to_numpy(outs[0]), utils.to_numpy(outs[1])
 
     def _train_step(self, inputs, targets, auxiliary_vars):
         if backend_name == "tensorflow.compat.v1":
@@ -353,44 +505,55 @@ class Model:
             self.sess.run(self.train_step, feed_dict=feed_dict)
         elif backend_name == "tensorflow":
             self.train_step(inputs, targets, auxiliary_vars)
-        elif backend_name == "pytorch":
+        elif backend_name in ["pytorch", "paddle"]:
             # TODO: auxiliary_vars
             self.train_step(inputs, targets)
         elif backend_name == "jax":
             # TODO: auxiliary_vars
-            self.train_step(inputs, targets)
+            self.params, self.opt_state = self.train_step(
+                self.params, self.opt_state, inputs, targets
+            )
+            self.net.params, self.external_trainable_variables = self.params
 
     @utils.timing
     def train(
         self,
-        epochs=None,
+        iterations=None,
         batch_size=None,
         display_every=1000,
         disregard_previous_best=False,
         callbacks=None,
         model_restore_path=None,
         model_save_path=None,
+        epochs=None,
     ):
-        """Trains the model for a fixed number of epochs (iterations on a dataset).
+        """Trains the model.
 
         Args:
-            epochs: Integer. Number of iterations to train the model. Note: It is the
-                number of iterations, not the number of epochs.
+            iterations (Integer): Number of iterations to train the model, i.e., number
+                of times the network weights are updated.
             batch_size: Integer or ``None``. If you solve PDEs via ``dde.data.PDE`` or
                 ``dde.data.TimePDE``, do not use `batch_size`, and instead use
                 `dde.callbacks.PDEResidualResampler
                 <https://deepxde.readthedocs.io/en/latest/modules/deepxde.html#deepxde.callbacks.PDEResidualResampler>`_,
                 see an `example <https://github.com/lululxvi/deepxde/blob/master/examples/diffusion_1d_resample.py>`_.
-            display_every: Integer. Print the loss and metrics every this steps.
+            display_every (Integer): Print the loss and metrics every this steps.
             disregard_previous_best: If ``True``, disregard the previous saved best
                 model.
             callbacks: List of ``dde.callbacks.Callback`` instances. List of callbacks
                 to apply during training.
-            model_restore_path: String. Path where parameters were previously saved.
-                See ``save_path`` in `tf.train.Saver.restore <https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/Saver#restore>`_.
-            model_save_path: String. Prefix of filenames created for the checkpoint.
-                See ``save_path`` in `tf.train.Saver.save <https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/Saver#save>`_.
+            model_restore_path (String): Path where parameters were previously saved.
+            model_save_path (String): Prefix of filenames created for the checkpoint.
+            epochs (Integer): Deprecated alias to `iterations`. This will be removed in
+                a future version.
         """
+        if iterations is None and epochs is not None:
+            print(
+                "Warning: epochs is deprecated and will be removed in a future version."
+                " Use iterations instead."
+            )
+            iterations = epochs
+
         self.batch_size = batch_size
         self.callbacks = CallbackList(callbacks=callbacks)
         self.callbacks.set_model(self)
@@ -421,9 +584,9 @@ class Model:
             elif backend_name == "pytorch":
                 self._train_pytorch_lbfgs()
         else:
-            if epochs is None:
-                raise ValueError("No epochs for {}.".format(self.opt_name))
-            self._train_sgd(epochs, display_every)
+            if iterations is None:
+                raise ValueError("No iterations for {}.".format(self.opt_name))
+            self._train_sgd(iterations, display_every)
         self.callbacks.on_train_end()
 
         print("")
@@ -432,8 +595,8 @@ class Model:
             self.save(model_save_path, verbose=1)
         return self.losshistory, self.train_state
 
-    def _train_sgd(self, epochs, display_every):
-        for i in range(epochs):
+    def _train_sgd(self, iterations, display_every):
+        for i in range(iterations):
             self.callbacks.on_epoch_begin()
             self.callbacks.on_batch_begin()
 
@@ -448,7 +611,7 @@ class Model:
 
             self.train_state.epoch += 1
             self.train_state.step += 1
-            if self.train_state.step % display_every == 0 or i + 1 == epochs:
+            if self.train_state.step % display_every == 0 or i + 1 == iterations:
                 self._test()
 
             self.callbacks.on_batch_end()
@@ -480,7 +643,7 @@ class Model:
         self.train_step.minimize(
             self.sess,
             feed_dict=feed_dict,
-            fetches=[self.outputs_losses[1]],
+            fetches=[self.outputs_losses_train[1]],
             loss_callback=loss_callback,
         )
         self._test()
@@ -599,16 +762,16 @@ class Model:
                 to apply during prediction.
         """
         if isinstance(x, tuple):
-            x = tuple(np.array(xi, dtype=config.real(np)) for xi in x)
+            x = tuple(np.asarray(xi, dtype=config.real(np)) for xi in x)
         else:
-            x = np.array(x, dtype=config.real(np))
-        self.callbacks = CallbackList(callbacks=callbacks)
-        self.callbacks.set_model(self)
-        self.callbacks.on_predict_begin()
+            x = np.asarray(x, dtype=config.real(np))
+        callbacks = CallbackList(callbacks=callbacks)
+        callbacks.set_model(self)
+        callbacks.on_predict_begin()
 
         if operator is None:
             y = self._outputs(False, x)
-            self.callbacks.on_predict_end()
+            callbacks.on_predict_end()
             return y
 
         # operator is not None
@@ -652,10 +815,25 @@ class Model:
                 # TODO: Pytorch backend Implementation of Auxiliary variables.
                 # y = operator(inputs, outputs, torch.as_tensor(aux_vars))
                 raise NotImplementedError(
-                    "Model.predict() with auxiliary variable hasn't been implemented for backend pytorch."
+                    "Model.predict() with auxiliary variable hasn't been implemented "
+                    "for backend pytorch."
                 )
             y = utils.to_numpy(y)
-        self.callbacks.on_predict_end()
+        elif backend_name == "paddle":
+            self.net.eval()
+            inputs = paddle.to_tensor(x, stop_gradient=False)
+            outputs = self.net(inputs)
+            if utils.get_num_args(operator) == 2:
+                y = operator(inputs, outputs)
+            elif utils.get_num_args(operator) == 3:
+                # TODO: Paddle backend Implementation of Auxiliary variables.
+                # y = operator(inputs, outputs, paddle.to_tensor(aux_vars))
+                raise NotImplementedError(
+                    "Model.predict() with auxiliary variable hasn't been implemented "
+                    "for backend paddle."
+                )
+            y = utils.to_numpy(y)
+        callbacks.on_predict_end()
         return y
 
     # def evaluate(self, x, y, callbacks=None):
@@ -673,7 +851,7 @@ class Model:
             values = self.sess.run(variables_names)
             for k, v in zip(variables_names, values):
                 destination[k] = v
-        elif backend_name == "pytorch":
+        elif backend_name in ["pytorch", "paddle"]:
             destination = self.net.state_dict()
         else:
             raise NotImplementedError(
@@ -686,14 +864,19 @@ class Model:
 
         Args:
             save_path (string): Prefix of filenames to save the model file.
-            protocol (string): If `protocol` is "backend", save using the backend-specific method.
-                For "tensorflow.compat.v1", use `tf.train.Save <https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/Saver#attributes>`_.
-                For "pytorch", use `torch.save <https://pytorch.org/docs/stable/generated/torch.save.html>`_.
-                If `protocol` is "pickle", save using the Python pickle module.
-                Only the protocol "backend" supports ``restore()``.
+            protocol (string): If `protocol` is "backend", save using the
+                backend-specific method.
+
+                - For "tensorflow.compat.v1", use `tf.train.Save <https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/Saver#attributes>`_.
+                - For "tensorflow", use `tf.keras.Model.save_weights <https://www.tensorflow.org/api_docs/python/tf/keras/Model#save_weights>`_.
+                - For "pytorch", use `torch.save <https://pytorch.org/docs/stable/generated/torch.save.html>`_.
+                - For "paddle", use `paddle.save <https://www.paddlepaddle.org.cn/documentation/docs/zh/api/paddle/save_cn.html#cn-api-paddle-framework-io-save>`_.
+
+                If `protocol` is "pickle", save using the Python pickle module. Only the
+                protocol "backend" supports ``restore()``.
 
         Returns:
-            string. Path where model is saved.
+            string: Path where model is saved.
         """
         # TODO: backend tensorflow
         save_path = f"{save_path}-{self.train_state.epoch}"
@@ -705,6 +888,9 @@ class Model:
             if backend_name == "tensorflow.compat.v1":
                 save_path += ".ckpt"
                 self.saver.save(self.sess, save_path)
+            elif backend_name == "tensorflow":
+                save_path += ".ckpt"
+                self.net.save_weights(save_path)
             elif backend_name == "pytorch":
                 save_path += ".pt"
                 checkpoint = {
@@ -712,6 +898,13 @@ class Model:
                     "optimizer_state_dict": self.opt.state_dict(),
                 }
                 torch.save(checkpoint, save_path)
+            elif backend_name == "paddle":
+                save_path += ".pdparams"
+                checkpoint = {
+                    "model": self.net.state_dict(),
+                    "opt": self.opt.state_dict(),
+                }
+                paddle.save(checkpoint, save_path)
             else:
                 raise NotImplementedError(
                     "Model.save() hasn't been implemented for this backend."
@@ -735,10 +928,16 @@ class Model:
             print("Restoring model from {} ...\n".format(save_path))
         if backend_name == "tensorflow.compat.v1":
             self.saver.restore(self.sess, save_path)
+        elif backend_name == "tensorflow":
+            self.net.load_weights(save_path)
         elif backend_name == "pytorch":
             checkpoint = torch.load(save_path)
             self.net.load_state_dict(checkpoint["model_state_dict"])
             self.opt.load_state_dict(checkpoint["optimizer_state_dict"])
+        elif backend_name == "paddle":
+            checkpoint = paddle.load(save_path)
+            self.net.set_state_dict(checkpoint["model"])
+            self.opt.set_state_dict(checkpoint["opt"])
         else:
             raise NotImplementedError(
                 "Model.restore() hasn't been implemented for this backend."
@@ -818,7 +1017,7 @@ class LossHistory:
         self.loss_train = []
         self.loss_test = []
         self.metrics_test = []
-        self.loss_weights = 1
+        self.loss_weights = None
 
     def set_loss_weights(self, loss_weights):
         self.loss_weights = loss_weights

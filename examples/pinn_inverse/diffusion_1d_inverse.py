@@ -1,10 +1,12 @@
-"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch"""
+"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch, paddle"""
 import deepxde as dde
 import numpy as np
 # Backend tensorflow.compat.v1 or tensorflow
 from deepxde.backend import tf
 # Backend pytorch
 # import torch
+# Backend paddle
+# import paddle
 
 
 C = dde.Variable(2.0)
@@ -26,6 +28,13 @@ def pde(x, y):
     #     - C * dy_xx
     #     + torch.exp(-x[:, 1:])
     #     * (torch.sin(np.pi * x[:, 0:1]) - np.pi ** 2 * torch.sin(np.pi * x[:, 0:1]))
+    # )
+    # Backend paddle
+    # return (
+    #     dy_t
+    #     - C * dy_xx
+    #     + paddle.exp(-x[:, 1:])
+    #     * (paddle.sin(np.pi * x[:, 0:1]) - np.pi ** 2 * paddle.sin(np.pi * x[:, 0:1]))
     # )
 
 
@@ -66,6 +75,6 @@ model.compile(
     "adam", lr=0.001, metrics=["l2 relative error"], external_trainable_variables=C
 )
 variable = dde.callbacks.VariableValue(C, period=1000)
-losshistory, train_state = model.train(epochs=50000, callbacks=[variable])
+losshistory, train_state = model.train(iterations=50000, callbacks=[variable])
 
 dde.saveplot(losshistory, train_state, issave=True, isplot=True)

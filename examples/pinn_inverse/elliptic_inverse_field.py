@@ -1,4 +1,4 @@
-"""Backend supported: tensorflow.compat.v1"""
+"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch"""
 import deepxde as dde
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,7 +19,7 @@ def pde(x, y):
 
 def sol(x):
     # solution is u(x) = sin(pi*x), q(x) = -pi^2 * sin(pi*x)
-    return np.sin(np.pi * x ** 2)
+    return np.sin(np.pi * x)
 
 
 geom = dde.geometry.Interval(-1, 1)
@@ -42,7 +42,7 @@ net = dde.nn.PFNN([1, [20, 20], [20, 20], [20, 20], 2], "tanh", "Glorot uniform"
 
 model = dde.Model(data, net)
 model.compile("adam", lr=0.0001, loss_weights=[1, 100, 1000])
-losshistory, train_state = model.train(epochs=20000)
+losshistory, train_state = model.train(iterations=20000)
 dde.saveplot(losshistory, train_state, issave=True, isplot=True)
 
 # view results

@@ -1,11 +1,12 @@
-"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch"""
+"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch, paddle"""
 import deepxde as dde
 import numpy as np
 # Backend tensorflow.compat.v1 or tensorflow
 from deepxde.backend import tf
 # Backend pytorch
 # import torch
-
+# Backend paddle
+# import paddle
 
 def pde(x, y):
     dy_t = dde.grad.jacobian(y, x, j=1)
@@ -23,6 +24,13 @@ def pde(x, y):
     #     - dy_xx
     #     + torch.exp(-x[:, 1:])
     #     * (torch.sin(np.pi * x[:, 0:1]) - np.pi ** 2 * torch.sin(np.pi * x[:, 0:1]))
+    # )
+    # Backend paddle
+    # return (
+    #     dy_t
+    #     - dy_xx
+    #     + paddle.exp(-x[:, 1:])
+    #     * (paddle.sin(np.pi * x[:, 0:1]) - np.pi ** 2 * paddle.sin(np.pi * x[:, 0:1]))
     # )
 
 
@@ -55,6 +63,6 @@ net = dde.nn.FNN(layer_size, activation, initializer)
 model = dde.Model(data, net)
 
 model.compile("adam", lr=0.001, metrics=["l2 relative error"])
-losshistory, train_state = model.train(epochs=10000)
+losshistory, train_state = model.train(iterations=10000)
 
 dde.saveplot(losshistory, train_state, issave=True, isplot=True)

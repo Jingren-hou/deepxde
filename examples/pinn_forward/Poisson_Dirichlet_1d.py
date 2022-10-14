@@ -1,4 +1,4 @@
-"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch"""
+"""Backend supported: tensorflow.compat.v1, tensorflow, pytorch, paddle"""
 import deepxde as dde
 import matplotlib.pyplot as plt
 import numpy as np
@@ -6,6 +6,8 @@ import numpy as np
 from deepxde.backend import tf
 # Import torch if using backend pytorch
 # import torch
+# Import paddle if using backend paddle
+# import paddle
 
 
 def pde(x, y):
@@ -14,6 +16,8 @@ def pde(x, y):
     return -dy_xx - np.pi ** 2 * tf.sin(np.pi * x)
     # Use torch.sin for backend pytorch
     # return -dy_xx - np.pi ** 2 * torch.sin(np.pi * x)
+    # Use paddle.sin for backend paddle
+    # return -dy_xx - np.pi ** 2 * paddle.sin(np.pi * x)
 
 
 def boundary(x, on_boundary):
@@ -36,7 +40,7 @@ net = dde.nn.FNN(layer_size, activation, initializer)
 model = dde.Model(data, net)
 model.compile("adam", lr=0.001, metrics=["l2 relative error"])
 
-losshistory, train_state = model.train(epochs=10000)
+losshistory, train_state = model.train(iterations=10000)
 # Optional: Save the model during training.
 # checkpointer = dde.callbacks.ModelCheckpoint(
 #     "model/model", verbose=1, save_better_only=True
@@ -46,7 +50,7 @@ losshistory, train_state = model.train(epochs=10000)
 # movie = dde.callbacks.MovieDumper(
 #     "model/movie", [-1], [1], period=100, save_spectrum=True, y_reference=func
 # )
-# losshistory, train_state = model.train(epochs=10000, callbacks=[checkpointer, movie])
+# losshistory, train_state = model.train(iterations=10000, callbacks=[checkpointer, movie])
 
 dde.saveplot(losshistory, train_state, issave=True, isplot=True)
 
